@@ -65,8 +65,9 @@ async function getContainerContent(container, session) {
 
 async function getStakeholders(projectPodUrl) {
   const myEngine = new QueryEngineComunicaSolid();
-  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?st where {<${projectPodUrl}> lbd:hasStakeholderNetwork ?st}`;
+  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?st where {<${projectPodUrl}> lbd:hasStakeholderGraph ?st}`;
   const result = await myEngine.query(q, { sources: [projectPodUrl] });
+  console.log(`result`, result)
   let stakeholderGraph;
   if (result.results.bindings.length > 0) {
     stakeholderGraph = result.results.bindings[0].st.value;
@@ -96,12 +97,14 @@ async function getProjectId(projectPodUrl) {
 
 async function getStakeholderMetadata(stakeholder, projectId) {
   try {
+    const myEngine = new QueryEngineComunicaSolid();
+
     const lbdLocation = await findLBDlocation(stakeholder);
     const projectRepository = await findProjectRepository(
       lbdLocation,
       projectId
     );
-    const resources = await findResourcesInRepository(projectRepository);
+    const resources = await findResourcesInRepository(projectRepository, myEngine);
     const data = {};
     data[stakeholder] = resources;
     return data;
@@ -111,30 +114,53 @@ async function getStakeholderMetadata(stakeholder, projectId) {
   }
 }
 
+async function getMetadataByStakeholder(st, projectId, myEngine, session) {
+  const lbd = await findLBDlocation(st)
+  const projectRepository = await findProjectRepository(lbd, projectId)
+  const resources = await findResourcesInRepository(projectRepository, myEngine)
+  const prom = resources.map((res) => findDistribution(res, myEngine, session))
+  const resp = await Promise.all(prom)
+  return resp
+}
+
 async function getProjectResources(projectPodUrl, session) {
   try {
+    console.log('getting resources')
+    const myEngine = new QueryEngineComunicaSolid();
+
     // find all stakeholders
     const stakeholders = await getStakeholders(projectPodUrl)
     const projectId = await getProjectId(projectPodUrl)
-    for (const st of stakeholders) {
-      const lbd = await findLBDlocation(st)
-      const projectRepository = await findProjectRepository(lbd, projectId)
-      const resources = await findResourcesInRepository(projectRepository)
-      for (const res of resources) {
-        console.log(res)
-      }
-    }
-    // find the project resources of these stakeholders,
+    const response = {}
+    const promises = stakeholders.map(st => {
+      return getMetadataByStakeholder(st, projectId, myEngine, session)
+    })
 
-    // find the metadata of these resources
+    const resolution = await Promise.all(promises)
+    resolution.flat().filter((v) => v !== undefined).forEach((el) => response[el.metadata] = el.distributions )
+
+    return response
   } catch (error) {
     console.log(error)
     throw error
   }
 }
 
-async function findResourcesInRepository(repository) {
-  const myEngine = new QueryEngineComunicaSolid();
+async function findDistribution(metadata, myEngine, session) {
+  const q = `
+  prefix ldp: <http://www.w3.org/ns/ldp#>
+  prefix dcat: <http://www.w3.org/ns/dcat#> 
+  select ?url 
+  where 
+  {?dataset a dcat:Dataset ; dcat:distribution ?dist . ?dist dcat:downloadURL ?url .}`;
+  const results = await myEngine.query(q, { sources: [metadata] });
+  const distributions = results.results.bindings.map(res => res.url.value)
+  if (distributions.length > 0) {
+    return {distributions: distributions.filter(dist => dist.length > 0), metadata}
+  }
+}
+
+async function findResourcesInRepository(repository, myEngine) {
   const q = `prefix ldp: <http://www.w3.org/ns/ldp#> select ?res where {?c a ldp:Container; ldp:contains ?res .}`;
 
   const result = await myEngine.query(q, { sources: [repository] });
@@ -303,7 +329,7 @@ INSERT DATA {
     PREFIX lbd: <https://lbdserver.org/vocabulary#>
     PREFIX dct:  <http://purl.org/dc/terms/>
     INSERT DATA {
-      <> lbd:hasStakeholderGraph <${stakeholderGraph}> .
+      <${webId}> lbd:hasStakeholderGraph <${stakeholderGraph}> .
     }`;
     await update(stQuery, webId, session);
   } catch (error) {

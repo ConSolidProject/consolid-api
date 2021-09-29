@@ -1,485 +1,193 @@
 import { QueryEngineComunicaSolid } from "graphql-ld-comunica-solid";
-import {
-  Session,
-  handleIncomingRedirect,
-  getDefaultSession,
-} from "@inrupt/solid-client-authn-browser";
-import { v4 } from "uuid";
-import { aclTemplate } from "./templates";
-import mime from "mime-types";
 
-async function getProject(projectPodUrl) {
-  try {
-    const [projectId, stakeholders] = await Promise.all([
-      getProjectId(projectPodUrl),
-      getStakeholders(projectPodUrl),
-    ]);
-    for (const st of stakeholders) {
-      const contribution = await getStakeholderMetadata(st, projectId);
+const N3 = require("n3");
+const { DataFactory } = N3;
+const { namedNode, literal, defaultGraph, quad } = DataFactory;
+const newEngine = require("@comunica/actor-init-sparql").newEngine
+const meta = "props.ttl"
+const prefixes = `
+prefix ldp: <http://www.w3.org/ns/ldp#> 
+prefix lbd: <https://lbdserver.org/vocabulary#>
+prefix dcat: <http://www.w3.org/ns/dcat#>
+prefix owl: <http://www.w3.org/2002/07/owl#>
+`
+
+async function executeQuery(query, sources, session) {
+  // const store = new N3.Store
+  // for (const source of sources) {
+  //   const response = await session.fetch(source)
+  //   const text = await response.text()
+  //   const parser = new N3.Parser();
+  //   await parseData(text, store, parser) 
+  // }
+  const q = prefixes + query
+  const myEngine = new QueryEngineComunicaSolid();
+  const results = await myEngine.query(q, {sources})
+  return results
+}
+
+async function extractQueryResults(results, variables) {
+  const resultObject = {}
+  for (const variable of variables) {
+    try {
+
+        resultObject[variable] = results.results.bindings.map(b => b[variable].value).filter(b => b != undefined)
+      
+      // const bindings = await results.bindings()
+      // console.log(`variable`, variable)
+      // resultObject[variable] = bindings.map(b => { console.log(b.get("?" + variable).id); return b.get("?" + variable).id})
+    } catch (error) {
+      console.log(`error`, error)
     }
-  } catch (error) {
-    console.log(`error`, error);
   }
+  return resultObject
 }
 
-async function getMyProjects(session) {
-  console.log('getting projects')
-  if (session.info.isLoggedIn && session.info.webId) {
-    const lbdLocation = await findLBDlocation(session.info.webId);
-    const myProjectIds = await getContainerContent(lbdLocation, session);
-    const projectPromises = myProjectIds.map((container) => {
-      return getProjectPod(container);
-    });
-    const myProjects = await Promise.all(projectPromises);
-    return myProjects;
-  } else {
-    throw new Error("No WebID associated with this session");
-  }
-}
-
-async function getProjectPod(localProjectUri) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const source = `${localProjectUri}props.ttl`
-  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?p where {<${localProjectUri}> lbd:isPartOfProject ?p .}`;
-  const result = await myEngine.query(q, {
-    sources: [source],
-  });
-  return result.results.bindings[0].p.value;
-}
-
-async function query(sources, query) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const result = await myEngine.query(query, {
-    sources,
-  });
-  return result.results.bindings;
-}
-
-async function getContainerContent(container, session) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const q = `prefix ldp: <http://www.w3.org/ns/ldp#> select ?res where {<${container}> ldp:contains ?res .}`;
-
-  const result = await myEngine.query(q, { sources: [container] });
-  return result.results.bindings.map((item) => item.res.value);
-}
-
-async function getStakeholders(projectPodUrl) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?st where {<${projectPodUrl}> lbd:hasStakeholderGraph ?st}`;
-  const result = await myEngine.query(q, { sources: [projectPodUrl] });
-  console.log(`result`, result)
-  let stakeholderGraph;
-  if (result.results.bindings.length > 0) {
-    stakeholderGraph = result.results.bindings[0].st.value;
-  } else {
-    throw new Error(
-      `Did not find stakeholder graph reference at project Pod ${projectPodUrl}`
-    );
-  }
-  const stq = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?st where {<${projectPodUrl}> lbd:hasStakeholder ?st}`;
-  const stakeholderResult = await myEngine.query(stq, {
-    sources: [stakeholderGraph],
-  });
-
-  return stakeholderResult.results.bindings.map((item) => item.st.value);
-}
-
-async function getProjectId(projectPodUrl) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?id where {<${projectPodUrl}> lbd:hasProjectId ?id}`;
-  const result = await myEngine.query(q, { sources: [projectPodUrl] });
-  if (result.results.bindings.length > 0) {
-    return result.results.bindings[0].id.value;
-  } else {
-    throw new Error(`Did not find project ID at project Pod ${projectPodUrl}`);
-  }
-}
-
-async function getStakeholderMetadata(stakeholder, projectId) {
+async function loadProjectMetadata(project, store, session) {
   try {
-    const myEngine = new QueryEngineComunicaSolid();
-
-    const lbdLocation = await findLBDlocation(stakeholder);
-    const projectRepository = await findProjectRepository(
-      lbdLocation,
-      projectId
-    );
-    const resources = await findResourcesInRepository(projectRepository, myEngine);
-    const data = {};
-    data[stakeholder] = resources;
-    return data;
-  } catch (error) {
-    console.log(`error`, error);
-    throw error;
-  }
-}
-
-async function getMetadataByStakeholder(st, projectId, myEngine, session) {
-  const lbd = await findLBDlocation(st)
-  const projectRepository = await findProjectRepository(lbd, projectId)
-  const resources = await findResourcesInRepository(projectRepository, myEngine)
-  const prom = resources.map((res) => findDistribution(res, myEngine, session))
-  const resp = await Promise.all(prom)
-  return resp
-}
-
-async function getProjectResources(projectPodUrl, session) {
-  try {
-    console.log('getting resources')
-    const myEngine = new QueryEngineComunicaSolid();
-
-    // find all stakeholders
-    const stakeholders = await getStakeholders(projectPodUrl)
-    const projectId = await getProjectId(projectPodUrl)
-    const response = {}
-    const promises = stakeholders.map(st => {
-      return getMetadataByStakeholder(st, projectId, myEngine, session)
-    })
-
-    const resolution = await Promise.all(promises)
-    resolution.flat().filter((v) => v !== undefined).forEach((el) => response[el.metadata] = el.distributions )
-
-    return response
-  } catch (error) {
-    console.log(error)
-    throw error
-  }
-}
-
-async function findDistribution(metadata, myEngine, session) {
-  const q = `
-  prefix ldp: <http://www.w3.org/ns/ldp#>
-  prefix dcat: <http://www.w3.org/ns/dcat#> 
-  select ?url 
-  where 
-  {?dataset a dcat:Dataset ; dcat:distribution ?dist . ?dist dcat:downloadURL ?url .}`;
-  const results = await myEngine.query(q, { sources: [metadata] });
-  const distributions = results.results.bindings.map(res => res.url.value)
-  if (distributions.length > 0) {
-    return {distributions: distributions.filter(dist => dist.length > 0), metadata}
-  }
-}
-
-async function findResourcesInRepository(repository, myEngine) {
-  const q = `prefix ldp: <http://www.w3.org/ns/ldp#> select ?res where {?c a ldp:Container; ldp:contains ?res .}`;
-
-  const result = await myEngine.query(q, { sources: [repository] });
-
-  // return only those files ending with meta
-  return result.results.bindings
-    .map((item) => item.res.value)
-    .filter((item) => {
-      if (item.endsWith("props.ttl")) {
-        return item;
-      }
-    });
-}
-
-async function findProjectRepository(lbdLoc, projectId) {
-  try {
-    const projectRepository = `${lbdLoc}${projectId}/`;
-    const exists = await fetch(projectRepository, { method: "HEAD" });
-    if (exists.ok) {
-      return projectRepository;
+  // find stakeholders in project
+  const projectId = await getProjectId(project, session)
+  const stakeholders = await getStakeholdersFromProject(project, session)
+  for (const st of stakeholders) {
+    const lbdLoc = await getLBDlocation(st, session)
+    const projLoc = lbdLoc + projectId + "/"
+    // fetch their artefactRegistries and put in local triplestore
+    const artLoc = projLoc + "artefactRegistry.ttl"
+    // const backendUrl = `http://localhost:5050/${projectId}/artefacts`
+    const artRes = await session.fetch(artLoc)
+    const artReg = await artRes.text()
+    if (artReg) {
+    const parser = new N3.Parser();
+    await parseData(artReg, store, parser, artLoc + "#")      
     } else {
-      throw new Error(
-        `Found LBD project location but did not find project with ID ${projectId}`
-      );
+      console.log(st, "has no artefact registry")
     }
+
+  }
+  return    
   } catch (error) {
-    throw error;
+    console.log(`error`, error)
   }
 }
 
-async function findLBDlocation(stakeholder) {
-  const myEngine = new QueryEngineComunicaSolid();
-  const q = `prefix lbd: <https://lbdserver.org/vocabulary#> select ?index where {<${stakeholder}> lbd:hasProjectRegistry ?index}`;
-  const result = await myEngine.query(q, { sources: [stakeholder] });
-  if (result.results.bindings.length > 0) {
-    return result.results.bindings[0].index.value;
-  } else {
-    throw new Error(
-      `Did not find LBD project location from webID ${stakeholder}`
-    );
-  }
+function parseData(data, store, parser, graph) {
+  return new Promise((resolve, reject) => {
+      if (data) {
+        parser.parse(data, (error, q, prefixes) => {
+            if (q) {
+              let s = q.subject.id
+              let p = q.predicate.id
+              let o = q.object.id
+              if (q.subject.id.startsWith('#')) {
+                s = graph + q.subject.id
+              }
+              if (q.predicate.id.startsWith('#')) {
+                p = graph + q.predicate.id
+              }
+              if (q.object.id.startsWith('#')) {
+                o = graph + q.object.id
+              }
+
+              const newQ = quad(
+                namedNode(s),
+                namedNode(p),
+                namedNode(o),
+                defaultGraph()
+              )
+              store.addQuad(newQ);
+            } else {
+              resolve();
+            }
+          });
+      }
+  });
 }
 
-async function joinProject(url, session) {
-  const webId = session.info.webId
-  const lbdLocation = await findLBDlocation(webId)
-  const projectId = await getProjectId(url)
-  const projectRepository = lbdLocation + projectId + '/'
-  await createContainer(projectRepository, session)
-
-
-  // update webId
+// get projects from aggregator
+async function getProjectsFromAggregator(aggregator, session) {
+  let aggr = aggregator
+  if (!aggr.endsWith('/')) aggr += '/'
   const query = `
-      PREFIX lbd: <https://lbdserver.org/vocabulary#>
-      PREFIX dct:  <http://purl.org/dc/terms/>
-      PREFIX dcat: <http://www.w3.org/ns/dcat#>
+  SELECT ?project WHERE {
+    ?s a lbd:Aggregator ;
+      lbd:aggregates ?project .
+  }`
 
-      INSERT DATA {
-      <${projectRepository}> a lbd:PartialProject, dcat:Catalog ;
-        lbd:hasProjectId "${projectId}" ;
-        lbd:isPartOfProject <${url}> .
-      }`;
-      await update(query, projectRepository + "props.ttl", session);
-
-  const aclUrl = projectRepository + '.acl'
-      const aclData = aclTemplate(session)
-
-  await uploadResource(aclUrl, aclData, {mimeType: "text/turtle"}, session)
+  const projects = await executeQuery(query, [aggr], session)
+  const {project} = await extractQueryResults(projects, ["project"])
+  return project
 }
 
-async function getAuthentication(session, setSession) {
-  try {
-    if (!session.info.isLoggedIn) {
-      const params = new URLSearchParams(window.location.search);
-      const solidCode = params.get("code");
-      if (solidCode) {
-        console.log("checking code param");
-        await handleIncomingRedirect();
-      } else {
-        console.log("checking previous session data");
-        await handleIncomingRedirect({ restorePreviousSession: true });
-      }
-      const s = await getDefaultSession();
-      setSession(s);
+// hardcoded assumption that id is last part of project URL
+async function getProjectId(project, session) {
+  const id = project.split('/')[project.split('/').length -2]
+  return id
+}
+
+// get stakeholders from project
+async function getStakeholdersFromProject(project, session) {
+  let proj = project
+  if (!proj.endsWith('/')) proj += '/'
+  const query = `
+  SELECT ?st WHERE {
+    <${project}> a lbd:PartialProject ;
+      lbd:hasMember ?st .
+  }`
+  const results = await executeQuery(query, [project], session)
+  const {st} = await extractQueryResults(results, ["st"])
+  return st
+}
+
+// get projectdata from stakeholders
+async function getProjectDataFromStakeholder(stakeholder, projectId, session) {
+  const LBDlocation = await getLBDlocation(stakeholder, session)
+  if (!projectId.endsWith("/")) projectId += '/'
+  const projectLocation = LBDlocation + projectId
+  const data = await getAuthorisedFilesInRepository(projectLocation, session)
+  return {stakeholder, data}
+}
+
+async function getAuthorisedFilesInRepository(stakeholderProjectRepository, session) {
+  const query = `
+    SELECT ?dataset WHERE {
+      <${stakeholderProjectRepository}> ldp:contains ?dataset .
     }
-  } catch (error) {
-    console.log(`error`, error);
+  `
+  const results = await executeQuery(query, [stakeholderProjectRepository], session)
+  const {dataset} = await extractQueryResults(results, ["dataset"])
+  const metadata = dataset.filter((el) => el.endsWith(meta))
+  const resources = []
+  for (const md of metadata) {
+    const accessRights = await getAccessRights(md, session)
+    const q = `
+    SELECT ?uri WHERE {
+      ?meta a dcat:Dataset ;
+      dcat:distribution ?dist .
+      ?dist dcat:downloadURL ?uri .
+    }`
+    const res2 = await executeQuery(q, [md], session)
+    const {uri} = await extractQueryResults(res2, ["uri"])
+    resources.push({artefactRegistry: stakeholderProjectRepository + "artefactRegistry.ttl", accessRights, metadata: md, main: uri[0]})
   }
+  return resources
 }
 
-async function createInbox(session, inbox) {
-  const webId = session.info.webId;
-
-  // create inbox folder
-  if (!inbox) {
-    inbox =  webId.split("profile/card#me")[0] + "inbox/";
-  }
-
-  const exists = await checkExistence(inbox, session)
-
-  if (!exists) {
-    await createContainer(inbox, session)
-
-    // update webId
-    const query = `
-    PREFIX lbd: <https://lbdserver.org/vocabulary#>
-    PREFIX dct:  <http://purl.org/dc/terms/> 
-    INSERT DATA {
-    
-    <> ldp:inbox <${inbox}>.
-    }`;
-      await update(query, webId, session);
-  }
-
-
-
+async function getAccessRights(resource, session) {
+  const requestOptions = {
+    method: "HEAD",
+  };
+  const result = await session.fetch(resource, requestOptions)
+  let rights = result.headers.get('WAC-Allow').split(',')
+  const user = rights[0].replace("user=", "").replaceAll('"', "").split(' ')
+  return user
 }
 
-async function makeThisAProjectPod(session, data) {
-  try {
-    const webId = session.info.webId;
-    const projectId = v4();
-
-    // 1 create basic content
-    const query = `
-PREFIX lbd: <https://lbdserver.org/vocabulary#>
-PREFIX dct:  <http://purl.org/dc/terms/> 
-INSERT DATA {
-
-  <${webId}> a lbd:Project ;
-    lbd:hasProjectId "${projectId}" ;
-    dct:title "${data.title}" ;
-    dct:description "${data.description}" .
-}`;
-    await update(query, webId, session);
-
-    // 2 create stakeholdernetwork graph
-    const dataContainer = webId.split("profile/card#me")[0] + "data/";
-
-    const dataExists = await checkExistence(dataContainer, session);
-    if (!dataExists) {
-      await createContainer(dataContainer, session);
-      await uploadResource(dataContainer + ".acl", aclTemplate(session), {mimeType: "text/turtle"}, session)
-    }
-
-    // 3 create stakeholdergraph in container
-    const stakeholderGraph = dataContainer + "stakeholders.ttl";
-    await createResource(stakeholderGraph, {mimeType: "text/turtle"}, session);
-
-    // insert data in stakeholdergraph
-    for (const st of data.stakeholders) {
-      console.log(`st`, st)
-      const query = `
-      PREFIX lbd: <https://lbdserver.org/vocabulary#>
-      INSERT DATA {
-
-        <${webId}> lbd:hasStakeholder <${st}>.
-      }`;
-      await update(query, stakeholderGraph, session);
-      console.log("stakeholder added")
-      await inviteStakeholder(st, session);
-    }
-
-    // add stakeholdergraph to webId reference
-        const stQuery = `
-    PREFIX lbd: <https://lbdserver.org/vocabulary#>
-    PREFIX dct:  <http://purl.org/dc/terms/>
-    INSERT DATA {
-      <${webId}> lbd:hasStakeholderGraph <${stakeholderGraph}> .
-    }`;
-    await update(stQuery, webId, session);
-  } catch (error) {
-    console.log(`error`, error);
-    throw error;
-  }
-}
-
-async function createResource(url, options, session) {
-  await uploadResource(url, "", options, session);
-}
-
-async function findInbox(webId) {
-  const res = await query(
-    [webId],
-    `prefix ldp: <http://www.w3.org/ns/ldp#> select * where {<${webId}> ldp:inbox ?inbox .}`
-  );
-  let inbox = res[0].inbox.value;
-  if (!inbox.endsWith("/")) {
-    inbox = inbox + "/";
-  }
-
-  return inbox
-}
-
-async function inviteStakeholder(st, session) {
-  const webId = session.info.webId
-  // find stakeholder inbox
-  const inbox = await findInbox(st)
-  const notificationId = v4();
-  const notificationUrl = inbox + notificationId + ".ttl";
-
-  // send notification about project invitation
-  const message = `
-  @prefix foaf: <http://xmlns.com/foaf/0.1/>.
-  @prefix solid: <http://www.w3.org/ns/solid/terms#>.
-  @prefix lbd: <https://lbdserver.org/vocabulary#>.
-  @prefix ldp: <http://www.w3.org/ns/ldp#> .
-  @prefix as: <https://www.w3.org/ns/activitystreams#> .
-  @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
-
-<>
-  a as:Announce ;
-  as:actor <${webId}> ;
-  as:object <#invite> ;
-  as:target <${st}> ;
-  as:updated "${new Date().toISOString()}"^^xsd:dateTime .
-
-<#invite> a lbd:projectInvitation .
-  `;
-  await uploadResource(notificationUrl, message, {}, session);
-}
-
-async function checkInvites(session) {
-  // find inbox
-  const inbox = await findInbox(session.info.webId)
-  const inboxContent = await getContainerContent(inbox, session)
-  const myProjects = await getMyProjects(session)
-
-  const res = await query(inboxContent, `
-  prefix lbd: <https://lbdserver.org/vocabulary#> 
-  prefix as: <https://www.w3.org/ns/activitystreams#> 
-  SELECT ?sender WHERE {?invite a lbd:projectInvitation. ?this as:actor ?sender; as:object ?invite .}`)
-  console.log(`res`, res)
-  
-  const projectInvites = res.map((i) => {
-      return i["sender"].value
-  })
-
-  
-  return projectInvites.filter((pr) => !myProjects.includes(pr))
-}
-
-async function uploadResource(url, data, options, session) {
-  try {
-    if (!options.overwrite) {
-      // check if graph does not exist yet
-      const exists = await checkExistence(url, session);
-      if (exists) {
-        throw new Error("Resource already exists");
-      }
-    }
-    //content-type is guessed by uri (default: text/plain)
-    let mimeType;
-    if (!options.mimeType) {
-      mimeType = mime.lookup(url);
-      if (mimeType === false) {
-        // set default mimetype
-        mimeType = "text/plain";
-      }
-    } else {
-      mimeType = options.mimeType;
-    }
-    var requestOptions = {
-      method: "PUT",
-      headers: {
-        "Content-Type": mimeType,
-      },
-      body: data,
-      redirect: "follow",
-    };
-
-    let res;
-    res = await session.fetch(url, requestOptions);
-    if (res.status !== 205) {
-      res = await fetch(url, requestOptions);
-    }
-    return;
-  } catch (error) {
-    console.log(`error`, error);
-    error.message = `Unable to upload resource - ${error.message}`;
-    throw error;
-  }
-}
-
-async function checkExistence(url, session) {
-  try {
-    const requestOptions = {
-      method: "HEAD",
-    };
-    const response = await session.fetch(url, requestOptions);
-    if (response.status === 200) {
-      return true;
-    } else {
-      return false;
-    }
-  } catch (error) {
-    error.message = `Could not check existence of graph ${url} - ${error.message}`;
-    throw error;
-  }
-}
-
-async function createContainer(url, session) {
-  try {
-    if (!url.endsWith("/")) {
-      url = url.concat("/");
-    }
-    const requestOptions = {
-      method: "PUT",
-      headers: {
-        "Content-Type": "text/turtle",
-      },
-      redirect: "follow",
-    };
-    await session.fetch(url, requestOptions);
-    return;
-  } catch (error) {
-    error.message = `Unable to create container - ${error.message}`;
-    throw error;
-  }
+async function getLBDlocation(stakeholder, session) {
+  const q = `select ?index where {<${stakeholder}> lbd:hasProjectRegistry ?index}`;
+  const results = await executeQuery(q, [stakeholder], session);
+  let {index} = await extractQueryResults(results, ["index"])
+  if (!index[0].endsWith("/")) index += '/'
+  return index[0]
 }
 
 async function update(query, graph, session) {
@@ -494,7 +202,6 @@ async function update(query, graph, session) {
       redirect: "follow",
     };
 
-    // console.log(`session.clientAuthentication.fetch`, session.clientAuthentication.fetch)
     let res;
     res = await session.fetch(graph, requestOptions);
     if (res.status !== 205) {
@@ -511,13 +218,32 @@ async function update(query, graph, session) {
   }
 }
 
+async function findObjectAliases(globalId, sources, session) {
+  const query = `
+  SELECT ?alias WHERE {
+  <${globalId}> owl:sameAs ?alias .
+  }
+  `
+  const results = await executeQuery(query, sources, session)
+  const {alias} = await extractQueryResults(results, ["alias"])
+  return alias
+}
+
+async function getLocalContexts(aliases, sources, session) {
+  
+}
+
 export {
-  getProject,
-  getMyProjects,
-  getAuthentication,
-  makeThisAProjectPod,
-  checkInvites,
-  joinProject,
-  Session,
-  getProjectResources
-};
+  executeQuery,
+  getAuthorisedFilesInRepository,
+  getStakeholdersFromProject,
+  getProjectsFromAggregator,
+  getProjectDataFromStakeholder,
+  getLBDlocation,
+  getAccessRights,
+  update,
+  findObjectAliases,
+  getLocalContexts,
+  loadProjectMetadata,
+  getProjectId
+}
